@@ -68,12 +68,12 @@ type telegramMarkup struct {
 }
 
 type telegramPendingItem struct {
-	ID, ProcessID                                    int
+	ID, ProcessID, Weight                            int
 	Code, Object, Document, Summary, Status, DueDate string
 }
 
 type telegramObservation struct {
-	ID, ProcessID                                                         int
+	ID, ProcessID, Weight                                                 int
 	Code, Object, Document, Summary, Original, Status, DueDate, Assignees string
 	Actions                                                               []string
 }
@@ -854,23 +854,23 @@ func (a *App) sendTelegramProcessNovelties(ctx context.Context, api *telegramAPI
 	if err != nil {
 		return err
 	}
-	rows, err := a.db.Query(`SELECT o.id,o.document,o.summary,o.status,o.due_date,o.original,o.area,o.received_date,o.invoice_amount,
+	rows, err := a.db.Query(`SELECT o.id,o.document,o.summary,o.status,o.weight,o.due_date,o.original,o.area,o.received_date,o.invoice_amount,
 		COALESCE((SELECT group_concat(a.name,', ') FROM assignees a WHERE a.observation_id=o.id),'')
 		FROM observations o JOIN processes p ON p.id=o.process_id WHERE p.id=? AND p.status<>'Archivado' AND o.status NOT IN ('Subsanada','No aplica')
 		AND (?='all' OR substr(p.accounting_date,1,4)=? OR substr(o.received_date,1,4)=? OR substr(o.created_at,1,4)=?)
-		AND (?=1 OR EXISTS(SELECT 1 FROM telegram_contacts t WHERE t.chat_id=?)) ORDER BY CASE WHEN o.due_date='' THEN 1 ELSE 0 END,o.due_date,o.id DESC`, processID, year, year, year, year, adminFlag, chat)
+		AND (?=1 OR EXISTS(SELECT 1 FROM telegram_contacts t WHERE t.chat_id=?)) ORDER BY o.weight DESC,CASE WHEN o.due_date='' THEN 1 ELSE 0 END,o.due_date,o.id DESC`, processID, year, year, year, year, adminFlag, chat)
 	if err != nil {
 		return err
 	}
 	type novelty struct {
-		id                                          int
+		id, weight                                  int
 		document, summary, status, due              string
 		original, area, received, amount, assignees string
 	}
 	var items []novelty
 	for rows.Next() {
 		var n novelty
-		if err := rows.Scan(&n.id, &n.document, &n.summary, &n.status, &n.due, &n.original, &n.area, &n.received, &n.amount, &n.assignees); err != nil {
+		if err := rows.Scan(&n.id, &n.document, &n.summary, &n.status, &n.weight, &n.due, &n.original, &n.area, &n.received, &n.amount, &n.assignees); err != nil {
 			rows.Close()
 			return err
 		}
@@ -914,7 +914,7 @@ func (a *App) sendTelegramProcessNovelties(ctx context.Context, api *telegramAPI
 			detail = strings.TrimSpace(n.summary)
 		}
 		prefix := fmt.Sprintf("\n\n%d. %s", i+1, telegramShort(doc, 90))
-		meta := fmt.Sprintf("\nEstado: %s · Límite: %s", n.status, telegramOrDash(n.due))
+		meta := fmt.Sprintf("\nEstado: %s · Peso: %d · Límite: %s", n.status, n.weight, telegramOrDash(n.due))
 		if n.assignees != "" {
 			meta += " · Responsable: " + telegramShort(n.assignees, 75)
 		}
@@ -976,18 +976,18 @@ func (a *App) sendTelegramProcessNovelties(ctx context.Context, api *telegramAPI
 
 func (a *App) sendTelegramPending(ctx context.Context, api *telegramAPI, admins map[int64]struct{}, chatID int64, offset int, existing *telegramMessage) error {
 	admin := isTelegramAdmin(chatID, admins)
-	rows, err := a.db.Query(`SELECT o.id,p.id,p.code,p.object,o.document,o.summary,o.status,o.due_date
+	rows, err := a.db.Query(`SELECT o.id,p.id,p.code,p.object,o.document,o.summary,o.status,o.weight,o.due_date
 		FROM observations o JOIN processes p ON p.id=o.process_id
 		WHERE p.status<>'Archivado' AND o.status NOT IN ('Subsanada','No aplica')
 		AND (?=1 OR EXISTS(SELECT 1 FROM telegram_contacts t WHERE t.chat_id=?))
-		ORDER BY CASE WHEN o.due_date='' THEN 1 ELSE 0 END,o.due_date,o.id DESC LIMIT ? OFFSET ?`, boolInt(admin), strconv.FormatInt(chatID, 10), telegramPageSize+1, offset)
+		ORDER BY o.weight DESC,CASE WHEN o.due_date='' THEN 1 ELSE 0 END,o.due_date,o.id DESC LIMIT ? OFFSET ?`, boolInt(admin), strconv.FormatInt(chatID, 10), telegramPageSize+1, offset)
 	if err != nil {
 		return err
 	}
 	items := make([]telegramPendingItem, 0, telegramPageSize+1)
 	for rows.Next() {
 		var item telegramPendingItem
-		if err := rows.Scan(&item.ID, &item.ProcessID, &item.Code, &item.Object, &item.Document, &item.Summary, &item.Status, &item.DueDate); err != nil {
+		if err := rows.Scan(&item.ID, &item.ProcessID, &item.Code, &item.Object, &item.Document, &item.Summary, &item.Status, &item.Weight, &item.DueDate); err != nil {
 			rows.Close()
 			return err
 		}
@@ -1021,7 +1021,7 @@ func (a *App) sendTelegramPending(ctx context.Context, api *telegramAPI, admins 
 		if detail == "" {
 			detail = "Ver novedad"
 		}
-		keyboard = append(keyboard, []telegramButton{{Text: telegramShort(code+" · "+detail, 60), CallbackData: fmt.Sprintf("v:%d:%d", item.ID, offset)}})
+		keyboard = append(keyboard, []telegramButton{{Text: telegramShort(fmt.Sprintf("P%d · %s · %s", item.Weight, code, detail), 60), CallbackData: fmt.Sprintf("v:%d:%d", item.ID, offset)}})
 	}
 	if hasMore || offset > 0 {
 		var page []telegramButton
@@ -1321,10 +1321,10 @@ func safeTelegramDocumentCategory(category string) bool {
 
 func (a *App) telegramObservation(id int) (telegramObservation, error) {
 	var item telegramObservation
-	err := a.db.QueryRow(`SELECT o.id,p.id,p.code,p.object,o.document,o.summary,o.original,o.status,o.due_date,
+	err := a.db.QueryRow(`SELECT o.id,p.id,p.code,p.object,o.document,o.summary,o.original,o.status,o.weight,o.due_date,
 		COALESCE((SELECT group_concat(a.name,', ') FROM assignees a WHERE a.observation_id=o.id),'')
 		FROM observations o JOIN processes p ON p.id=o.process_id WHERE o.id=? AND p.status<>'Archivado'`, id).
-		Scan(&item.ID, &item.ProcessID, &item.Code, &item.Object, &item.Document, &item.Summary, &item.Original, &item.Status, &item.DueDate, &item.Assignees)
+		Scan(&item.ID, &item.ProcessID, &item.Code, &item.Object, &item.Document, &item.Summary, &item.Original, &item.Status, &item.Weight, &item.DueDate, &item.Assignees)
 	if err != nil {
 		return item, err
 	}
@@ -1393,7 +1393,7 @@ func telegramObservationText(item telegramObservation) string {
 	if document == "" {
 		document = "Novedad sin título"
 	}
-	text := fmt.Sprintf("📌 %s\n%s\n\nNovedad: %s\nEstado: %s\nFecha límite: %s\nResponsables: %s", code, item.Object, document, item.Status, telegramOrDash(item.DueDate), telegramOrDash(item.Assignees))
+	text := fmt.Sprintf("📌 %s\n%s\n\nNovedad: %s\nEstado: %s · Peso: %d\nFecha límite: %s\nResponsables: %s", code, item.Object, document, item.Status, item.Weight, telegramOrDash(item.DueDate), telegramOrDash(item.Assignees))
 	if strings.TrimSpace(item.Summary) != "" && strings.TrimSpace(item.Summary) != document {
 		text += "\n\nResumen:\n" + item.Summary
 	}

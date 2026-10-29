@@ -90,6 +90,7 @@ type SignatureReview struct {
 
 type Observation struct {
 	ID, ProcessID                                                                          int
+	Weight                                                                                 int
 	Area, Document, Original, Summary, Priority, Status                                    string
 	DueDate, CreatedAt, ProcessCode, ReceivedDate, InvoiceAmount, DocumentationDeliveredAt string
 	AccountingDate, Invoice, Supplier                                                      string
@@ -235,6 +236,7 @@ func main() {
 	mux.HandleFunc("GET /documents/{id}", a.downloadDocument)
 	mux.HandleFunc("POST /documents/{id}/verify-signatures", a.verifyStoredDocumentSignatures)
 	mux.HandleFunc("POST /observations", a.createObservation)
+	mux.HandleFunc("GET /observations/weights", a.observationWeights)
 	mux.HandleFunc("POST /observations/status", a.updateStatus)
 	mux.HandleFunc("POST /observations/comment", a.addComment)
 	mux.HandleFunc("POST /observations/documentation-delivered", a.markDocumentationDelivered)
@@ -308,7 +310,7 @@ CREATE INDEX IF NOT EXISTS processes_code_idx ON processes(code);
 CREATE TABLE IF NOT EXISTS observations (
  id INTEGER PRIMARY KEY, process_id INTEGER NOT NULL REFERENCES processes(id), area TEXT NOT NULL DEFAULT '',
  document TEXT NOT NULL DEFAULT '', original TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
- priority TEXT NOT NULL DEFAULT 'Normal', status TEXT NOT NULL DEFAULT 'Pendiente', due_date TEXT NOT NULL DEFAULT '',
+ priority TEXT NOT NULL DEFAULT 'Normal', weight INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'Pendiente', due_date TEXT NOT NULL DEFAULT '',
  created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS observations_process_idx ON observations(process_id);
@@ -359,6 +361,9 @@ CREATE TABLE IF NOT EXISTS activity (
 		return err
 	}
 	if err := ensureColumn(db, "observations", "documentation_delivered_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "observations", "weight", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS documents (
@@ -1063,9 +1068,14 @@ func (a *App) createObservation(w http.ResponseWriter, r *http.Request) {
 	if !validStatus(status) {
 		status = "Pendiente"
 	}
-	result, err := a.db.Exec(`INSERT INTO observations(process_id,area,document,original,summary,priority,status,due_date,received_date,invoice_amount,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+	weight, err := observationWeight(r.Form.Get("weight"))
+	if err != nil {
+		http.Error(w, "El peso debe ser un número entero entre 0 y 999", 400)
+		return
+	}
+	result, err := a.db.Exec(`INSERT INTO observations(process_id,area,document,original,summary,priority,weight,status,due_date,received_date,invoice_amount,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		id, trim(r.Form.Get("area")), trim(r.Form.Get("document")), trim(r.Form.Get("original")), trim(r.Form.Get("summary")),
-		validPriority(trim(r.Form.Get("priority"))), status, validDate(trim(r.Form.Get("due_date"))), validDate(trim(r.Form.Get("received_date"))), trim(r.Form.Get("invoice_amount")), now())
+		validPriority(trim(r.Form.Get("priority"))), weight, status, validDate(trim(r.Form.Get("due_date"))), validDate(trim(r.Form.Get("received_date"))), trim(r.Form.Get("invoice_amount")), now())
 	if err != nil {
 		http.Error(w, "No se pudo guardar la observación", 500)
 		return
@@ -1085,6 +1095,7 @@ func (a *App) updateStatus(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.Form.Get("id"))
 	status := trim(r.Form.Get("status"))
 	priority := trim(r.Form.Get("priority"))
+	weightInput := trim(r.Form.Get("weight"))
 	if id < 1 || !validStatus(status) {
 		http.Error(w, "Datos inválidos", 400)
 		return
@@ -1093,11 +1104,16 @@ func (a *App) updateStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Prioridad inválida", 400)
 		return
 	}
+	weight, err := observationWeight(weightInput)
+	if err != nil {
+		http.Error(w, "El peso debe ser un número entero entre 0 y 999", 400)
+		return
+	}
 	if status == "Subsanada" && r.Form.Get("accounting_reviewed") != "yes" {
 		http.Error(w, "No se marcó la novedad: primero confirma que Contabilidad ya la revisó.", 400)
 		return
 	}
-	res, err := a.db.Exec("UPDATE observations SET status=?,priority=CASE WHEN ?='' THEN priority ELSE ? END WHERE id=?", status, priority, priority, id)
+	res, err := a.db.Exec("UPDATE observations SET status=?,priority=CASE WHEN ?='' THEN priority ELSE ? END,weight=CASE WHEN ?='' THEN weight ELSE ? END WHERE id=?", status, priority, priority, weightInput, weight, id)
 	if err != nil {
 		http.Error(w, "No se pudo actualizar el estado", 500)
 		return
@@ -1111,8 +1127,40 @@ func (a *App) updateStatus(w http.ResponseWriter, r *http.Request) {
 	if priority != "" {
 		message += " · Prioridad: " + priority
 	}
+	if weightInput != "" {
+		message += " · Peso: " + strconv.Itoa(weight)
+	}
 	_, _ = a.db.Exec("INSERT INTO activity(observation_id,message,created_at) VALUES(?,?,?)", id, message, now())
 	redirectAfterAction(w, r, "Estado actualizado")
+}
+
+func (a *App) observationWeights(w http.ResponseWriter, r *http.Request) {
+	processID, err := strconv.Atoi(r.URL.Query().Get("process_id"))
+	if err != nil || processID < 1 {
+		http.Error(w, "Proceso inválido", http.StatusBadRequest)
+		return
+	}
+	rows, err := a.db.Query("SELECT id,weight FROM observations WHERE process_id=?", processID)
+	if err != nil {
+		http.Error(w, "No se pudieron consultar los pesos", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	weights := map[int]int{}
+	for rows.Next() {
+		var id, weight int
+		if err := rows.Scan(&id, &weight); err != nil {
+			http.Error(w, "No se pudieron consultar los pesos", http.StatusInternalServerError)
+			return
+		}
+		weights[id] = weight
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "No se pudieron consultar los pesos", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(weights)
 }
 
 func (a *App) markReadyForPayment(w http.ResponseWriter, r *http.Request) {
@@ -1242,14 +1290,15 @@ func (a *App) processDetail(w http.ResponseWriter, r *http.Request) {
 	} else if noveltyFilter == "todas" {
 		filterClause = ""
 	}
-	rows, err := a.db.Query(`SELECT id,process_id,area,document,original,summary,priority,status,due_date,created_at,received_date,invoice_amount,documentation_delivered_at FROM observations WHERE process_id=?`+filterClause+`
+	rows, err := a.db.Query(`SELECT id,process_id,area,document,original,summary,priority,weight,status,due_date,created_at,received_date,invoice_amount,documentation_delivered_at FROM observations WHERE process_id=?`+filterClause+`
 		ORDER BY CASE WHEN status IN ('Subsanada','No aplica') THEN 1 ELSE 0 END,
+		weight DESC,
 		CASE priority WHEN 'Urgente' THEN 0 WHEN 'Alta' THEN 1 WHEN 'Normal' THEN 2 WHEN 'Baja' THEN 3 ELSE 4 END,
 		CASE WHEN due_date='' THEN 1 ELSE 0 END,due_date,id DESC`, id)
 	if err == nil {
 		for rows.Next() {
 			var o Observation
-			if rows.Scan(&o.ID, &o.ProcessID, &o.Area, &o.Document, &o.Original, &o.Summary, &o.Priority, &o.Status, &o.DueDate, &o.CreatedAt, &o.ReceivedDate, &o.InvoiceAmount, &o.DocumentationDeliveredAt) == nil {
+			if rows.Scan(&o.ID, &o.ProcessID, &o.Area, &o.Document, &o.Original, &o.Summary, &o.Priority, &o.Weight, &o.Status, &o.DueDate, &o.CreatedAt, &o.ReceivedDate, &o.InvoiceAmount, &o.DocumentationDeliveredAt) == nil {
 				p.Observations = append(p.Observations, o)
 			}
 		}
@@ -2142,6 +2191,18 @@ func validPriority(s string) string {
 		return s
 	}
 	return "Normal"
+}
+
+func observationWeight(s string) (int, error) {
+	s = trim(s)
+	if s == "" {
+		return 0, nil
+	}
+	weight, err := strconv.Atoi(s)
+	if err != nil || weight < 0 || weight > 999 {
+		return 0, fmt.Errorf("peso inválido")
+	}
+	return weight, nil
 }
 
 func validProcessPriority(s string) string {
