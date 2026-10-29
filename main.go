@@ -40,6 +40,7 @@ type App struct {
 
 type Process struct {
 	ID                                                                                           int
+	Weight                                                                                       int
 	Code, Kind, Entity, Object, Status, URL, Supplier, Invoice, Priority                         string
 	Amount, ExecutionDays                                                                        string
 	ContractDate, StartDate, Deadline, CreatedAt                                                 string
@@ -99,6 +100,8 @@ type Observation struct {
 
 type PageData struct {
 	Processes                             []Process
+	ProcessListURL                        string
+	ProcessStatuses                       []string
 	Recent                                []Observation
 	Query, Message                        string
 	OpenCount                             int
@@ -112,6 +115,8 @@ type PageData struct {
 	SearchMode                            bool
 	Section                               string
 	Year, StatusFilter, AssigneeFilter    string
+	ProcessPriorityFilter                 string
+	MinWeightFilter, MaxWeightFilter      string
 	ProcessFilter                         string
 	NoveltyFilter                         string
 	ReturnURL                             string
@@ -226,6 +231,7 @@ func main() {
 	mux.HandleFunc("POST /settings", a.saveSettings)
 	mux.HandleFunc("POST /processes", a.createProcess)
 	mux.HandleFunc("POST /processes/update", a.updateProcess)
+	mux.HandleFunc("POST /processes/weight", a.updateProcessWeight)
 	mux.HandleFunc("POST /processes/update-from-text", a.updateProcessFromText)
 	mux.HandleFunc("POST /processes/archive", a.archiveProcess)
 	mux.HandleFunc("POST /processes/ready-for-payment", a.markReadyForPayment)
@@ -234,6 +240,7 @@ func main() {
 	mux.HandleFunc("GET /process", a.processDetail)
 	mux.HandleFunc("POST /processes/documents", a.uploadDocument)
 	mux.HandleFunc("GET /documents/{id}", a.downloadDocument)
+	mux.HandleFunc("POST /documents/{id}/delete", a.deleteDocument)
 	mux.HandleFunc("POST /documents/{id}/verify-signatures", a.verifyStoredDocumentSignatures)
 	mux.HandleFunc("POST /observations", a.createObservation)
 	mux.HandleFunc("GET /observations/weights", a.observationWeights)
@@ -339,6 +346,7 @@ CREATE TABLE IF NOT EXISTS activity (
 	}
 	columns := map[string]string{
 		"address": "TEXT NOT NULL DEFAULT ''", "cpc": "TEXT NOT NULL DEFAULT ''", "item_description": "TEXT NOT NULL DEFAULT ''",
+		"weight":        "INTEGER NOT NULL DEFAULT 0",
 		"contract_date": "TEXT NOT NULL DEFAULT ''",
 		"priority":      "TEXT NOT NULL DEFAULT ''",
 		"unit":          "TEXT NOT NULL DEFAULT ''", "quantity": "TEXT NOT NULL DEFAULT ''", "payment_method": "TEXT NOT NULL DEFAULT ''",
@@ -573,8 +581,12 @@ func (a *App) home(w http.ResponseWriter, r *http.Request) {
 		archiveFilter = "activos"
 	}
 	processName := strings.TrimSpace(r.URL.Query().Get("proceso"))
-	filters := SearchFilters{Query: q, Year: r.URL.Query().Get("anio"), Status: r.URL.Query().Get("estado"), Assignee: r.URL.Query().Get("responsable"), Archive: archiveFilter, Process: processName}
-	data := PageData{Query: q, AIEnabled: key != "", AIModel: model, Message: r.URL.Query().Get("msg"), SearchMode: q != "", Section: section, Year: filters.Year, StatusFilter: filters.Status, AssigneeFilter: filters.Assignee, ArchiveFilter: archiveFilter, ProcessFilter: filters.Process, CurrentPage: page, Years: a.searchYears()}
+	filters := SearchFilters{Query: q, Year: r.URL.Query().Get("anio"), Status: r.URL.Query().Get("estado"), Assignee: r.URL.Query().Get("responsable"), Archive: archiveFilter, Process: processName, ProcessPriority: r.URL.Query().Get("prioridad"), MinWeight: validWeightFilter(r.URL.Query().Get("peso_min")), MaxWeight: validWeightFilter(r.URL.Query().Get("peso_max"))}
+	data := PageData{Query: q, AIEnabled: key != "", AIModel: model, Message: r.URL.Query().Get("msg"), SearchMode: q != "", Section: section, Year: filters.Year, StatusFilter: filters.Status, AssigneeFilter: filters.Assignee, ArchiveFilter: archiveFilter, ProcessFilter: filters.Process, ProcessPriorityFilter: filters.ProcessPriority, MinWeightFilter: filters.MinWeight, MaxWeightFilter: filters.MaxWeight, CurrentPage: page, Years: a.searchYears()}
+	processParams := r.URL.Query()
+	processParams.Del("msg")
+	processParams.Set("vista", "procesos")
+	data.ProcessListURL = "/?" + processParams.Encode()
 	if section == "novedades" {
 		params := r.URL.Query()
 		params.Set("vista", "novedades")
@@ -598,6 +610,11 @@ func (a *App) home(w http.ResponseWriter, r *http.Request) {
 		}
 		data.Recent, total, err = a.searchObservations(filters, pageSize, (page-1)*pageSize)
 	} else {
+		data.ProcessStatuses, err = a.processStatuses(filters.Archive != "activos")
+		if err != nil {
+			http.Error(w, "No se pudieron cargar los estados", 500)
+			return
+		}
 		data.Processes, total, err = a.searchProcesses(filters, pageSize, (page-1)*pageSize)
 	}
 	if err != nil {
@@ -627,6 +644,33 @@ func (a *App) home(w http.ResponseWriter, r *http.Request) {
 	if err := a.view.Execute(w, data); err != nil {
 		log.Printf("render: %v", err)
 	}
+}
+
+func (a *App) updateProcessWeight(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Formulario inválido", http.StatusBadRequest)
+		return
+	}
+	id, err := strconv.Atoi(r.Form.Get("process_id"))
+	if err != nil || id < 1 {
+		http.Error(w, "Proceso inválido", http.StatusBadRequest)
+		return
+	}
+	weight, err := strconv.Atoi(r.Form.Get("weight"))
+	if err != nil || weight < 0 || weight > 1000 {
+		http.Error(w, "El peso debe ser un número entre 0 y 1000", http.StatusBadRequest)
+		return
+	}
+	result, err := a.db.Exec("UPDATE processes SET weight=? WHERE id=?", weight, id)
+	if err != nil {
+		http.Error(w, "No se pudo guardar el peso", http.StatusInternalServerError)
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	redirectAfterAction(w, r, "Peso del proceso actualizado")
 }
 
 func (a *App) aiConfig() (string, string) {
@@ -1613,6 +1657,42 @@ func (a *App) downloadDocument(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, filename, info.ModTime(), f)
 }
 
+func (a *App) deleteDocument(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id < 1 {
+		http.Error(w, "Documento inválido", http.StatusBadRequest)
+		return
+	}
+	var processID int
+	var stored string
+	if err := a.db.QueryRow("SELECT process_id,stored_name FROM documents WHERE id=?", id).Scan(&processID, &stored); errors.Is(err, sql.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	} else if err != nil {
+		http.Error(w, "No se pudo consultar el documento", http.StatusInternalServerError)
+		return
+	}
+	if r.FormValue("confirm_delete") != "yes" {
+		http.Error(w, "Confirma el borrado del documento", http.StatusBadRequest)
+		return
+	}
+	if stored == "" || filepath.Base(stored) != stored {
+		http.Error(w, "Ruta de documento inválida", http.StatusInternalServerError)
+		return
+	}
+	dir := filepath.Join(a.documentDir, strconv.Itoa(processID))
+	if err := os.Remove(filepath.Join(dir, stored)); err != nil && !os.IsNotExist(err) {
+		http.Error(w, "No se pudo eliminar el archivo", http.StatusInternalServerError)
+		return
+	}
+	if _, err := a.db.Exec("DELETE FROM documents WHERE id=?", id); err != nil {
+		http.Error(w, "No se pudo eliminar el registro del documento", http.StatusInternalServerError)
+		return
+	}
+	r.Form.Set("process_id", strconv.Itoa(processID))
+	redirect(w, r, "Versión de documento eliminada")
+}
+
 type cappedOutput struct {
 	data []byte
 	max  int
@@ -1906,7 +1986,21 @@ func (a *App) localAnswer(q string) string {
 	return "Coincidencias en los registros locales:\n" + strings.Join(found, "\n")
 }
 
-type SearchFilters struct{ Query, Year, Status, Assignee, Archive, Process string }
+type SearchFilters struct {
+	Query, Year, Status, Assignee, Archive, Process string
+	ProcessPriority, MinWeight, MaxWeight           string
+}
+
+func validWeightFilter(value string) string {
+	if value == "" {
+		return ""
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 || n > 1000 {
+		return ""
+	}
+	return strconv.Itoa(n)
+}
 
 func searchValues(f SearchFilters) url.Values {
 	v := url.Values{}
@@ -1928,6 +2022,15 @@ func searchValues(f SearchFilters) url.Values {
 	if f.Archive != "" && f.Archive != "activos" {
 		v.Set("archivados", f.Archive)
 	}
+	if f.ProcessPriority != "" {
+		v.Set("prioridad", f.ProcessPriority)
+	}
+	if f.MinWeight != "" {
+		v.Set("peso_min", f.MinWeight)
+	}
+	if f.MaxWeight != "" {
+		v.Set("peso_max", f.MaxWeight)
+	}
 	return v
 }
 
@@ -1936,6 +2039,27 @@ func searchPageURL(section string, f SearchFilters, page int) string {
 	v.Set("vista", section)
 	v.Set("pagina", strconv.Itoa(page))
 	return "/?" + v.Encode()
+}
+
+func (a *App) processStatuses(includeArchived bool) ([]string, error) {
+	query := `SELECT DISTINCT status FROM processes WHERE trim(status)<>'' ORDER BY status COLLATE NOCASE`
+	if !includeArchived {
+		query = `SELECT DISTINCT status FROM processes WHERE trim(status)<>'' AND status<>'Archivado' ORDER BY status COLLATE NOCASE`
+	}
+	rows, err := a.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var statuses []string
+	for rows.Next() {
+		var status string
+		if err := rows.Scan(&status); err != nil {
+			return nil, err
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, rows.Err()
 }
 
 func observationWhere(f SearchFilters) (string, []any) {
@@ -1990,6 +2114,7 @@ func (a *App) searchYears() []string {
 func (a *App) searchProcesses(f SearchFilters, limit, offset int) ([]Process, int, error) {
 	where := []string{"1=1"}
 	args := []any{}
+	priorityExpr := `COALESCE(NULLIF(p.priority,''),(SELECT o.priority FROM observations o WHERE o.process_id=p.id AND o.status NOT IN ('Subsanada','No aplica') ORDER BY CASE o.priority WHEN 'Urgente' THEN 1 WHEN 'Alta' THEN 2 WHEN 'Normal' THEN 3 WHEN 'Baja' THEN 4 ELSE 5 END, CASE WHEN o.due_date='' THEN 1 ELSE 0 END, o.due_date, o.id DESC LIMIT 1),'Sin prioridad')`
 	switch f.Archive {
 	case "archivados":
 		where = append(where, "p.status='Archivado'")
@@ -2012,14 +2137,25 @@ func (a *App) searchProcesses(f SearchFilters, limit, offset int) ([]Process, in
 		where = append(where, "p.status=?")
 		args = append(args, f.Status)
 	}
+	if f.ProcessPriority != "" {
+		where = append(where, priorityExpr+"=?")
+		args = append(args, f.ProcessPriority)
+	}
+	if f.MinWeight != "" {
+		where = append(where, "p.weight>=?")
+		args = append(args, f.MinWeight)
+	}
+	if f.MaxWeight != "" {
+		where = append(where, "p.weight<=?")
+		args = append(args, f.MaxWeight)
+	}
 	clause := strings.Join(where, " AND ")
 	var total int
 	if err := a.db.QueryRow("SELECT count(*) FROM processes p WHERE "+clause, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	queryArgs := append(append([]any{}, args...), limit, offset)
-	priorityExpr := `COALESCE(NULLIF(p.priority,''),(SELECT o.priority FROM observations o WHERE o.process_id=p.id AND o.status NOT IN ('Subsanada','No aplica') ORDER BY CASE o.priority WHEN 'Urgente' THEN 1 WHEN 'Alta' THEN 2 WHEN 'Normal' THEN 3 WHEN 'Baja' THEN 4 ELSE 5 END, CASE WHEN o.due_date='' THEN 1 ELSE 0 END, o.due_date, o.id DESC LIMIT 1),'Sin prioridad')`
-	rows, err := a.db.Query(`SELECT p.id,p.code,p.kind,p.entity,p.object,p.status,p.url,p.supplier,p.invoice,p.amount,p.execution_days,p.start_date,p.deadline,p.created_at, `+priorityExpr+` AS process_priority FROM processes p WHERE `+clause+` ORDER BY CASE process_priority WHEN 'Urgente' THEN 1 WHEN 'Alta' THEN 2 WHEN 'Normal' THEN 3 WHEN 'Baja' THEN 4 ELSE 5 END, CASE WHEN p.deadline='' THEN 1 ELSE 0 END, p.deadline, p.id DESC LIMIT ? OFFSET ?`, queryArgs...)
+	rows, err := a.db.Query(`SELECT p.id,p.code,p.kind,p.entity,p.object,p.status,p.url,p.supplier,p.invoice,p.amount,p.execution_days,p.start_date,p.deadline,p.created_at, `+priorityExpr+` AS process_priority,p.weight FROM processes p WHERE `+clause+` ORDER BY p.weight DESC, CASE process_priority WHEN 'Urgente' THEN 1 WHEN 'Alta' THEN 2 WHEN 'Normal' THEN 3 WHEN 'Baja' THEN 4 ELSE 5 END, CASE WHEN p.deadline='' THEN 1 ELSE 0 END, p.deadline, p.id DESC LIMIT ? OFFSET ?`, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2027,7 +2163,7 @@ func (a *App) searchProcesses(f SearchFilters, limit, offset int) ([]Process, in
 	var result []Process
 	for rows.Next() {
 		var p Process
-		if err := rows.Scan(&p.ID, &p.Code, &p.Kind, &p.Entity, &p.Object, &p.Status, &p.URL, &p.Supplier, &p.Invoice, &p.Amount, &p.ExecutionDays, &p.StartDate, &p.Deadline, &p.CreatedAt, &p.Priority); err != nil {
+		if err := rows.Scan(&p.ID, &p.Code, &p.Kind, &p.Entity, &p.Object, &p.Status, &p.URL, &p.Supplier, &p.Invoice, &p.Amount, &p.ExecutionDays, &p.StartDate, &p.Deadline, &p.CreatedAt, &p.Priority, &p.Weight); err != nil {
 			return nil, 0, err
 		}
 		result = append(result, p)
