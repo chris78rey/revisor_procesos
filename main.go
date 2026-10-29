@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-pdf/fpdf"
 	"github.com/xuri/excelize/v2"
@@ -158,6 +159,7 @@ type ReportRow struct {
 type ObservationReportFilters struct {
 	Query, Status, Year, Assignee, From, To string
 	ProcessID                               int
+	OpenOnly                                bool
 }
 
 type ObservationReportRow struct {
@@ -2131,16 +2133,47 @@ func (a *App) ask(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"answer": answer, "source": "consulta local"})
 		return
 	}
-	var out struct {
-		Answer string `json:"answer"`
+	var answerJSON json.RawMessage
+	err := a.openRouter(r.Context(), key, model, "Responde en español con precisión solo usando el contexto JSON local. Si falta información, dilo claramente. No supongas reglas legales ni fechas ausentes. Devuelve JSON {\"answer\":\"respuesta en texto\"}; answer debe ser una cadena, no una lista.", contextText+"\n\nPregunta: "+q, &answerJSON)
+	answer := openRouterAnswerText(answerJSON)
+	if err == nil && answer == "" {
+		err = errors.New("respuesta vacía de OpenRouter")
 	}
-	err := a.openRouter(r.Context(), key, model, "Responde en español con precisión solo usando el contexto JSON local. Si falta información, dilo claramente. No supongas reglas legales ni fechas ausentes. Devuelve JSON {\"answer\":\"...\"}.", contextText+"\n\nPregunta: "+q, &out)
 	if err != nil {
 		log.Printf("OpenRouter query failed: %v", err)
-		out.Answer = a.localAnswer(q) + " (consulta local; OpenRouter no respondió)"
+		answer = a.localAnswer(q) + " (consulta local; OpenRouter no respondió)"
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{"answer": out.Answer, "source": "registros locales"})
+	_ = json.NewEncoder(w).Encode(map[string]any{"answer": answer, "source": "registros locales"})
+}
+
+func openRouterAnswerText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil {
+		if answer, ok := object["answer"]; ok {
+			return openRouterAnswerText(answer)
+		}
+		formatted, _ := json.MarshalIndent(object, "", "  ")
+		return strings.TrimSpace(string(formatted))
+	}
+	var list []json.RawMessage
+	if json.Unmarshal(raw, &list) == nil {
+		items := make([]string, 0, len(list))
+		for _, item := range list {
+			if text := openRouterAnswerText(item); text != "" {
+				items = append(items, text)
+			}
+		}
+		return strings.Join(items, "\n")
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 func (a *App) openRouter(ctx context.Context, key, model, system, user string, target any) error {
@@ -2180,7 +2213,12 @@ func (a *App) openRouter(ctx context.Context, key, model, system, user string, t
 }
 
 func (a *App) contextForQuery(q string) string {
-	rows, err := a.db.Query(`SELECT p.code,p.object,p.supplier,p.status,p.deadline,o.id,o.area,o.document,o.summary,o.status,o.due_date FROM processes p LEFT JOIN observations o ON o.process_id=p.id ORDER BY p.id DESC LIMIT 300`)
+	query := `SELECT p.code,p.object,p.supplier,p.status,p.deadline,o.id,o.area,o.document,o.summary,o.status,o.due_date FROM processes p LEFT JOIN observations o ON o.process_id=p.id`
+	if queryAsksOpenItems(q) {
+		query += ` WHERE p.status<>'Archivado' AND (o.id IS NULL OR o.status NOT IN ('Subsanada','No aplica'))`
+	}
+	query += ` ORDER BY p.id DESC,o.id DESC LIMIT 300`
+	rows, err := a.db.Query(query)
 	if err != nil {
 		return "[]"
 	}
@@ -2202,30 +2240,111 @@ func (a *App) contextForQuery(q string) string {
 }
 
 func (a *App) localAnswer(q string) string {
-	rows, err := a.db.Query(`SELECT p.code,p.supplier,p.object,o.area,o.document,o.summary,o.status,o.due_date FROM processes p LEFT JOIN observations o ON o.process_id=p.id ORDER BY p.id DESC LIMIT 300`)
+	querySQL := `SELECT p.id,p.code,p.supplier,p.object,o.area,o.document,o.summary,o.status,o.due_date FROM processes p LEFT JOIN observations o ON o.process_id=p.id`
+	openOnly := queryAsksOpenItems(q)
+	if openOnly {
+		querySQL += ` WHERE p.status<>'Archivado' AND (o.id IS NULL OR o.status NOT IN ('Subsanada','No aplica'))`
+	}
+	querySQL += ` ORDER BY p.id DESC,o.id DESC LIMIT 300`
+	rows, err := a.db.Query(querySQL)
 	if err != nil {
 		return "No se pudieron consultar los registros locales."
 	}
 	defer rows.Close()
-	query := strings.ToLower(q)
-	var found []string
+	tokens := queryKeywords(q)
+	type match struct {
+		processScore int
+		totalScore   int
+		text         string
+	}
+	var matches []match
+	bestProcessScore := 0
 	for rows.Next() {
+		var processID int
 		var code, supplier, object, area, document, summary, status, due string
-		if rows.Scan(&code, &supplier, &object, &area, &document, &summary, &status, &due) != nil {
+		if rows.Scan(&processID, &code, &supplier, &object, &area, &document, &summary, &status, &due) != nil {
 			continue
 		}
-		joined := strings.Join([]string{code, supplier, object, area, document, summary, status, due}, " · ")
-		if containsAny(query, code, supplier, object, area, document, summary) {
-			found = append(found, joined)
+		processScore := matchingQueryTokens(tokens, code, supplier, object)
+		noveltyScore := matchingQueryTokens(tokens, area, document, summary)
+		if processScore+noveltyScore == 0 {
+			continue
 		}
+		if processScore > bestProcessScore {
+			bestProcessScore = processScore
+		}
+		problem := strings.TrimSpace(strings.Join([]string{document, summary}, " · "))
+		joined := strings.Join([]string{code, supplier, object, problem, status, due}, " · ")
+		matches = append(matches, match{processScore: processScore, totalScore: processScore + noveltyScore, text: joined})
+	}
+	var found []string
+	for _, item := range matches {
+		if bestProcessScore > 0 && item.processScore != bestProcessScore {
+			continue
+		}
+		found = append(found, item.text)
 	}
 	if len(found) == 0 {
+		if openOnly {
+			return "No encontré novedades abiertas que coincidan con esa pregunta."
+		}
 		return "No encontré coincidencias en los registros guardados."
 	}
 	if len(found) > 8 {
 		found = found[:8]
 	}
 	return "Coincidencias en los registros locales:\n" + strings.Join(found, "\n")
+}
+
+func normalizeQueryText(value string) string {
+	value = strings.ToLower(value)
+	value = strings.NewReplacer("á", "a", "é", "e", "í", "i", "ó", "o", "ú", "u", "ü", "u", "ñ", "n").Replace(value)
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return r
+		}
+		return ' '
+	}, value)
+}
+
+func queryAsksOpenItems(q string) bool {
+	query := " " + normalizeQueryText(q) + " "
+	for _, term := range []string{" aun ", " todavia ", " pendiente ", " pendientes ", " falta ", " faltan ", " por entregar ", " por presentar ", " por solventar ", " deben pasar ", " debe pasar ", " deben entregar ", " debe entregar ", " deben presentar ", " debe presentar ", " abiertas ", " abiertos "} {
+		if strings.Contains(query, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func queryKeywords(q string) []string {
+	stop := map[string]bool{"a": true, "al": true, "de": true, "del": true, "el": true, "la": true, "las": true, "los": true, "un": true, "una": true, "unos": true, "unas": true, "que": true, "cual": true, "cuales": true, "como": true, "cuando": true, "donde": true, "por": true, "para": true, "con": true, "sin": true, "sobre": true, "nos": true, "me": true, "te": true, "se": true, "deben": true, "debe": true, "pasar": true, "entregar": true, "presentar": true, "aun": true, "todavia": true, "pendiente": true, "pendientes": true, "proceso": true, "procesos": true}
+	seen := make(map[string]bool)
+	var tokens []string
+	for _, token := range strings.Fields(normalizeQueryText(q)) {
+		if len([]rune(token)) >= 3 && !stop[token] && !seen[token] {
+			seen[token] = true
+			tokens = append(tokens, token)
+		}
+	}
+	return tokens
+}
+
+func matchingQueryTokens(tokens []string, fields ...string) int {
+	normalized := make([]string, len(fields))
+	for i, field := range fields {
+		normalized[i] = " " + normalizeQueryText(field) + " "
+	}
+	score := 0
+	for _, token := range tokens {
+		for _, field := range normalized {
+			if strings.Contains(field, " "+token+" ") {
+				score++
+				break
+			}
+		}
+	}
+	return score
 }
 
 type SearchFilters struct {
@@ -2631,6 +2750,9 @@ func observationReportWhere(f ObservationReportFilters) (string, []any) {
 		where = append(where, "o.status=?")
 		args = append(args, f.Status)
 	}
+	if f.OpenOnly {
+		where = append(where, "o.status NOT IN ('Subsanada','No aplica')")
+	}
 	if f.ProcessID > 0 {
 		where = append(where, "p.id=?")
 		args = append(args, f.ProcessID)
@@ -2749,6 +2871,7 @@ func (a *App) exportObservationActionsXLSX(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	filters := reportObservationFilters(r.Form)
+	filters.OpenOnly = true
 	selected := parseSelectedObservationProcesses(r.Form["nov_procesos"])
 	if len(selected) == 0 {
 		http.Error(w, "Selecciona al menos un proceso para crear el Excel", http.StatusBadRequest)
