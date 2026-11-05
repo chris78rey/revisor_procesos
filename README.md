@@ -53,6 +53,18 @@ Detén la aplicación y copia el archivo SQLite, su archivo `-wal` si existe y l
 sqlite3 data/revisor.db ".backup 'revisor-backup.db'"
 ```
 
+## Documentos del expediente
+
+En la pestaña **Documentos** de cada proceso, los archivos se agrupan por tipo (orden de compra, contrato, términos de referencia y cada anexo por su nombre). Cada carga crea una versión nueva; la más reciente aparece como **Vigente** y las demás como **Anterior**.
+
+- **Ordenar y filtrar:** ordena los tipos (estándar, actividad reciente o nombre), invierte el orden de las versiones, muestra solo la vigente o busca por nombre de archivo.
+- **Cambiar tipo:** reclasifica un documento ya cargado. Pasa a ser la versión más reciente del tipo elegido y su archivo se mueve a la carpeta correspondiente. Si el nuevo tipo es orden o contrato se verifican sus firmas.
+- **Visor integrado:** el botón **Ver** abre PDFs e imágenes (PNG, JPG, GIF, WebP) dentro de la aplicación, con navegación entre documentos (botones o flechas del teclado). El contenido se comprueba antes de mostrarlo; SVG y HTML nunca se sirven en línea.
+
+## Seguridad
+
+La aplicación rechaza solicitudes de escritura (POST) que provengan de otro origen, para que una página web abierta en el navegador no pueda modificar tus datos locales. Sigue sin haber autenticación: no la expongas a una red compartida.
+
 ## Estado del MVP
 
 Incluye creación, edición, archivo y reactivación de procesos; detección de códigos repetidos; búsqueda histórica por texto y año; reporte de novedades filtrable por año, estado y responsable con paginación y exportación CSV de todos los resultados filtrados; ordenamiento asistido de texto libre, tablas, correos y reportes con revisión antes de guardar; campos de resolución, justificación, modalidad, adjudicación, funcionario, fechas de control, rubro, precios y calificaciones; ítems múltiples por proceso con CPC, rubro, descripción, cantidad, unidad, precio unitario y subtotal; proveedor/RUC y forma de pago; novedades con responsables independientes e historial; documentos de orden, términos de referencia y anexos con nombre propio, versiones anteriores conservadas; consultas opcionales con OpenRouter. El cómputo de días usa fecha calendario de la máquina y es referencial; no aplica feriados ni determina cumplimiento normativo.

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -58,6 +57,7 @@ type Process struct {
 	Observations                                                                                 []Observation
 	Items                                                                                        []ProcessItem
 	Documents                                                                                    []DocumentVersion
+	DocumentGroups                                                                               []DocumentGroup
 	OpenObservationCount                                                                         int
 	OverdueObservationCount                                                                      int
 	ClosedObservationCount                                                                       int
@@ -76,6 +76,8 @@ type ProcessItem struct {
 type DocumentVersion struct {
 	ID, ProcessID, Version               int
 	Category, Label, Filename, CreatedAt string
+	Title, Kind                          string
+	Latest                               bool
 	SignatureStatus, SignatureAwardDate  string
 	Signatures                           []DocumentSignature
 }
@@ -280,6 +282,8 @@ func main() {
 	mux.HandleFunc("GET /process", a.processDetail)
 	mux.HandleFunc("POST /processes/documents", a.uploadDocument)
 	mux.HandleFunc("GET /documents/{id}", a.downloadDocument)
+	mux.HandleFunc("GET /documents/{id}/view", a.viewDocument)
+	mux.HandleFunc("POST /documents/{id}/classify", a.classifyDocument)
 	mux.HandleFunc("POST /documents/{id}/delete", a.deleteDocument)
 	mux.HandleFunc("POST /documents/{id}/verify-signatures", a.verifyStoredDocumentSignatures)
 	mux.HandleFunc("POST /observations", a.createObservation)
@@ -307,7 +311,8 @@ func main() {
 		addr = "127.0.0.1:8080"
 	}
 	log.Printf("Revisor local disponible en http://%s (SQLite: %s)", addr, dbPath)
-	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
+	server := &http.Server{Addr: addr, Handler: securityHeaders(mux), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	log.Fatal(server.ListenAndServe())
 }
 
 func loadDotEnv(path string) error {
@@ -606,9 +611,40 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; form-action 'self'; frame-ancestors 'self'")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		if crossOriginWrite(r) {
+			http.Error(w, "Solicitud de otro origen bloqueada", http.StatusForbidden)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// crossOriginWrite reports whether a state-changing request was started by a
+// page from another origin. The app has no login, so any website the user
+// opens could otherwise POST to the local server (CSRF).
+func crossOriginWrite(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+		return site != "same-origin" && site != "none"
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false // non-browser clients (curl, scripts) do not send Origin
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return true
+	}
+	if strings.EqualFold(u.Host, r.Host) {
+		return false
+	}
+	// Behind a reverse proxy the Host header may have been rewritten.
+	return !strings.EqualFold(u.Host, r.Header.Get("X-Forwarded-Host"))
 }
 
 func (a *App) home(w http.ResponseWriter, r *http.Request) {
@@ -1611,6 +1647,7 @@ func (a *App) processDetail(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	p.DocumentGroups = groupDocuments(p.Documents)
 	key, model := a.aiConfig()
 	data := PageData{AIEnabled: key != "", AIModel: model, Message: r.URL.Query().Get("msg"), NoveltyFilter: noveltyFilter}
 	_ = a.view.ExecuteTemplate(w, "detail", struct {
@@ -1629,18 +1666,12 @@ func (a *App) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		defer r.MultipartForm.RemoveAll()
 	}
 	id, err := strconv.Atoi(r.FormValue("process_id"))
-	category := r.FormValue("category")
-	label := ""
-	if category == "anexo" {
-		label = trim(r.FormValue("document_label"))
-		if len(label) > 160 || label == "" {
-			http.Error(w, "Indica el nombre del anexo (máximo 160 caracteres)", 400)
-			return
-		}
-		sum := sha256.Sum256([]byte(strings.ToLower(label)))
-		category = "anexo-" + fmt.Sprintf("%x", sum[:6])
+	category, label, catErr := documentCategoryFromForm(r.FormValue("category"), r.FormValue("document_label"))
+	if catErr != nil {
+		http.Error(w, catErr.Error(), 400)
+		return
 	}
-	if err != nil || id < 1 || (category != "orden" && category != "contrato" && category != "terminos" && !strings.HasPrefix(category, "anexo-")) {
+	if err != nil || id < 1 {
 		http.Error(w, "Proceso o tipo de documento inválido", 400)
 		return
 	}
@@ -1908,8 +1939,8 @@ func (a *App) deleteDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var processID int
-	var stored string
-	if err := a.db.QueryRow("SELECT process_id,stored_name FROM documents WHERE id=?", id).Scan(&processID, &stored); errors.Is(err, sql.ErrNoRows) {
+	var category, stored string
+	if err := a.db.QueryRow("SELECT process_id,category,stored_name FROM documents WHERE id=?", id).Scan(&processID, &category, &stored); errors.Is(err, sql.ErrNoRows) {
 		http.NotFound(w, r)
 		return
 	} else if err != nil {
@@ -1924,8 +1955,7 @@ func (a *App) deleteDocument(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Ruta de documento inválida", http.StatusInternalServerError)
 		return
 	}
-	dir := filepath.Join(a.documentDir, strconv.Itoa(processID))
-	if err := os.Remove(filepath.Join(dir, stored)); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(a.documentPath(processID, category, stored)); err != nil && !os.IsNotExist(err) {
 		http.Error(w, "No se pudo eliminar el archivo", http.StatusInternalServerError)
 		return
 	}
@@ -2126,6 +2156,7 @@ func (a *App) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	contextText := a.contextForQuery(q)
+	answerSource := "OpenRouter y registros locales"
 	key, model := a.aiConfig()
 	if key == "" {
 		answer := a.localAnswer(q)
@@ -2142,9 +2173,10 @@ func (a *App) ask(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("OpenRouter query failed: %v", err)
 		answer = a.localAnswer(q) + " (consulta local; OpenRouter no respondió)"
+		answerSource = "consulta local"
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{"answer": answer, "source": "registros locales"})
+	_ = json.NewEncoder(w).Encode(map[string]any{"answer": answer, "source": answerSource})
 }
 
 func openRouterAnswerText(raw json.RawMessage) string {
@@ -2214,6 +2246,19 @@ func (a *App) openRouter(ctx context.Context, key, model, system, user string, t
 
 func (a *App) contextForQuery(q string) string {
 	query := `SELECT p.code,p.object,p.supplier,p.status,p.deadline,o.id,o.area,o.document,o.summary,o.status,o.due_date FROM processes p LEFT JOIN observations o ON o.process_id=p.id`
+	if code := a.processCodeInQuery(q); code != "" {
+		query += ` WHERE p.code=?`
+		if queryAsksOpenItems(q) {
+			query += ` AND p.status<>'Archivado' AND (o.id IS NULL OR o.status NOT IN ('Subsanada','No aplica'))`
+		}
+		query += ` ORDER BY o.id DESC`
+		rows, err := a.db.Query(query, code)
+		if err != nil {
+			return "[]"
+		}
+		defer rows.Close()
+		return marshalQueryContext(rows)
+	}
 	if queryAsksOpenItems(q) {
 		query += ` WHERE p.status<>'Archivado' AND (o.id IS NULL OR o.status NOT IN ('Subsanada','No aplica'))`
 	}
@@ -2223,6 +2268,10 @@ func (a *App) contextForQuery(q string) string {
 		return "[]"
 	}
 	defer rows.Close()
+	return marshalQueryContext(rows)
+}
+
+func marshalQueryContext(rows *sql.Rows) string {
 	type record struct {
 		Code, Object, Supplier, ProcessStatus, Deadline string
 		ObservationID                                   any
@@ -2240,6 +2289,12 @@ func (a *App) contextForQuery(q string) string {
 }
 
 func (a *App) localAnswer(q string) string {
+	if code := a.processCodeInQuery(q); code != "" && queryAsksProcessStage(q) {
+		var object, status string
+		if err := a.db.QueryRow(`SELECT object,status FROM processes WHERE code=? COLLATE NOCASE ORDER BY id DESC LIMIT 1`, code).Scan(&object, &status); err == nil {
+			return fmt.Sprintf("El proceso %s está en la etapa: %s. Objeto: %s", code, status, object)
+		}
+	}
 	querySQL := `SELECT p.id,p.code,p.supplier,p.object,o.area,o.document,o.summary,o.status,o.due_date FROM processes p LEFT JOIN observations o ON o.process_id=p.id`
 	openOnly := queryAsksOpenItems(q)
 	if openOnly {
@@ -2294,6 +2349,73 @@ func (a *App) localAnswer(q string) string {
 		found = found[:8]
 	}
 	return "Coincidencias en los registros locales:\n" + strings.Join(found, "\n")
+}
+
+func queryAsksProcessStage(q string) bool {
+	query := " " + normalizeQueryText(q) + " "
+	for _, term := range []string{" etapa ", " estado ", " como vamos ", " en que fase ", " situacion actual "} {
+		if strings.Contains(query, term) {
+			return true
+		}
+	}
+	return false
+}
+
+type processCandidate struct {
+	code, object, supplier string
+}
+
+func (a *App) processCodeInQuery(q string) string {
+	rows, err := a.db.Query(`SELECT code,object,supplier FROM processes ORDER BY length(code) DESC`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	var candidates []processCandidate
+	for rows.Next() {
+		var candidate processCandidate
+		if rows.Scan(&candidate.code, &candidate.object, &candidate.supplier) == nil {
+			candidates = append(candidates, candidate)
+		}
+	}
+	return selectProcessCode(q, candidates)
+}
+
+// selectProcessCode finds the process a question refers to: first by its code
+// (whole words only, ignoring empty codes), then by at least two words shared
+// with its object or supplier when exactly one process matches best.
+func selectProcessCode(q string, candidates []processCandidate) string {
+	query := " " + strings.Join(strings.Fields(normalizeQueryText(q)), " ") + " "
+	best, bestLen := "", 0
+	for _, candidate := range candidates {
+		code := strings.Join(strings.Fields(normalizeQueryText(candidate.code)), " ")
+		if code == "" || len(code) <= bestLen {
+			continue
+		}
+		if strings.Contains(query, " "+code+" ") {
+			best, bestLen = candidate.code, len(code)
+		}
+	}
+	if best != "" {
+		return best
+	}
+	keywords := queryKeywords(q)
+	bestScore, bestCode, tied := 1, "", false
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.code) == "" {
+			continue
+		}
+		score := matchingQueryTokens(keywords, candidate.object, candidate.supplier)
+		if score > bestScore {
+			bestScore, bestCode, tied = score, candidate.code, false
+		} else if score == bestScore && score > 1 && candidate.code != bestCode {
+			tied = true
+		}
+	}
+	if tied {
+		return ""
+	}
+	return bestCode
 }
 
 func normalizeQueryText(value string) string {
@@ -2877,31 +2999,43 @@ func (a *App) exportObservationActionsXLSX(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "Selecciona al menos un proceso para crear el Excel", http.StatusBadRequest)
 		return
 	}
-	var rows []ObservationReportRow
+	groups := make([]ObservationReportGroup, 0, len(selected))
+	totalRows := 0
 	for _, processID := range selected {
 		if filters.ProcessID > 0 && processID != filters.ProcessID {
 			continue
 		}
+		group := ObservationReportGroup{ProcessID: processID}
+		if err := a.db.QueryRow(`SELECT code,object,supplier FROM processes WHERE id=?`, processID).Scan(&group.Code, &group.Object, &group.Supplier); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			log.Printf("observation report process lookup: %v", err)
+			http.Error(w, "No se pudieron consultar los procesos seleccionados", http.StatusInternalServerError)
+			return
+		}
 		processFilters := filters
 		processFilters.ProcessID = processID
-		remaining := 501 - len(rows)
+		remaining := 501 - totalRows
 		processRows, total, searchErr := a.searchObservationReport(processFilters, remaining)
 		if searchErr != nil {
 			log.Printf("observation report spreadsheet query: %v", searchErr)
 			http.Error(w, "No se pudieron consultar las novedades", http.StatusInternalServerError)
 			return
 		}
-		if total > len(processRows) || len(rows)+len(processRows) > 500 {
+		if total > len(processRows) || totalRows+len(processRows) > 500 {
 			http.Error(w, "Los procesos seleccionados superan 500 novedades. Reduce la selección o agrega filtros.", http.StatusRequestEntityTooLarge)
 			return
 		}
-		rows = append(rows, processRows...)
+		group.Observations = processRows
+		groups = append(groups, group)
+		totalRows += len(processRows)
 	}
-	if len(rows) == 0 {
-		http.Error(w, "Los procesos seleccionados no tienen novedades con los filtros actuales", http.StatusBadRequest)
+	if len(groups) == 0 {
+		http.Error(w, "No hay procesos seleccionados que coincidan con los filtros", http.StatusBadRequest)
 		return
 	}
-	workbook, err := buildObservationActionsXLSX(rows, time.Now())
+	workbook, err := buildObservationActionsXLSX(groups, time.Now())
 	if err != nil {
 		log.Printf("observation actions Excel: %v", err)
 		http.Error(w, "No se pudo generar el Excel", http.StatusInternalServerError)
@@ -2927,9 +3061,9 @@ func parseSelectedObservationProcesses(values []string) []int {
 	return ids
 }
 
-func buildObservationActionsXLSX(rows []ObservationReportRow, generated time.Time) (*bytes.Buffer, error) {
-	if len(rows) == 0 {
-		return nil, errors.New("sin novedades")
+func buildObservationActionsXLSX(groups []ObservationReportGroup, generated time.Time) (*bytes.Buffer, error) {
+	if len(groups) == 0 {
+		return nil, errors.New("sin procesos seleccionados")
 	}
 	book := excelize.NewFile()
 	defer book.Close()
@@ -2980,7 +3114,14 @@ func buildObservationActionsXLSX(rows []ObservationReportRow, generated time.Tim
 						return nameErr
 					}
 				}
-				if cellErr = book.SetRowHeight(sheet, row, 52); cellErr != nil {
+				maxLines := 1
+				for col, value := range values {
+					if col < len(widths) {
+						maxLines = max(maxLines, estimateExcelWrappedLines(fmt.Sprint(value), widths[col]))
+					}
+				}
+				height := min(390.0, max(44.0, float64(maxLines)*18+10))
+				if cellErr = book.SetRowHeight(sheet, row, height); cellErr != nil {
 					return cellErr
 				}
 			}
@@ -3008,7 +3149,6 @@ func buildObservationActionsXLSX(rows []ObservationReportRow, generated time.Tim
 	}
 
 	noveltyHeaders := []string{"Proceso", "Problema", "Acción a tomar"}
-	groups := groupObservationReportRows(rows)
 	usedSheetNames := make(map[string]bool, len(groups))
 	for groupIndex, group := range groups {
 		sheet := observationProcessSheetName(group.Object, group.ProcessID)
@@ -3031,6 +3171,13 @@ func buildObservationActionsXLSX(rows []ObservationReportRow, generated time.Tim
 			}
 		}
 		processNoveltyData := make([][]any, 0, len(group.Observations))
+		if len(group.Observations) == 0 {
+			process := strings.TrimSpace(group.Object)
+			if group.Code != "" {
+				process = group.Code + " · " + process
+			}
+			processNoveltyData = append(processNoveltyData, []any{process, "Sin novedades pendientes con los filtros seleccionados.", "—"})
+		}
 		for _, row := range group.Observations {
 			process := strings.TrimSpace(row.Object)
 			if row.Code != "" {
@@ -3080,6 +3227,39 @@ func observationProcessSheetName(processName string, processID int) string {
 		name = fmt.Sprintf("Proceso %d", processID)
 	}
 	return name
+}
+
+func estimateExcelWrappedLines(text string, columnWidth float64) int {
+	charsPerLine := max(1, int(columnWidth*1.1))
+	lineCount := 0
+	for _, paragraph := range strings.Split(text, "\n") {
+		words := strings.Fields(paragraph)
+		if len(words) == 0 {
+			lineCount++
+			continue
+		}
+		current := 0
+		for _, word := range words {
+			wordLength := len([]rune(word))
+			if current > 0 && current+1+wordLength <= charsPerLine {
+				current += 1 + wordLength
+				continue
+			}
+			if current > 0 {
+				lineCount++
+				current = 0
+			}
+			for wordLength > charsPerLine {
+				lineCount++
+				wordLength -= charsPerLine
+			}
+			current = wordLength
+		}
+		if current > 0 {
+			lineCount++
+		}
+	}
+	return max(1, lineCount)
 }
 
 func buildObservationActionsPDF(rows []ObservationReportRow, generated time.Time) ([]byte, error) {

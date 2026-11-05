@@ -96,29 +96,53 @@ func parseTelegramAdminIDs(value string) map[int64]struct{} {
 }
 
 func (a *App) runTelegramBot(ctx context.Context, token string, admins map[int64]struct{}) {
+	for ctx.Err() == nil {
+		if err := a.runTelegramBotSession(ctx, token, admins); err != nil && ctx.Err() == nil {
+			log.Printf("Telegram no está disponible (%s); se reintentará en 30 segundos", telegramErrorForLog(err))
+		}
+		if !waitContext(ctx, 30*time.Second) {
+			return
+		}
+	}
+}
+
+var (
+	errTelegramWebhook = errors.New("el bot tiene un webhook configurado; la lectura por polling no está disponible")
+	errTelegramCursor  = errors.New("no se pudo leer el cursor de Telegram")
+)
+
+// telegramErrorForLog describes a session error without leaking the bot token:
+// transport errors from the HTTP client embed the request URL, which contains
+// it, so only our own sentinel errors are printed verbatim.
+func telegramErrorForLog(err error) string {
+	switch {
+	case errors.Is(err, errTelegramWebhook), errors.Is(err, errTelegramCursor):
+		return err.Error()
+	default:
+		return fmt.Sprintf("%T", err)
+	}
+}
+
+func (a *App) runTelegramBotSession(ctx context.Context, token string, admins map[int64]struct{}) error {
 	api := &telegramAPI{token: token, client: &http.Client{Timeout: 40 * time.Second}}
 	var me struct {
 		Username string `json:"username"`
 	}
 	if err := api.call(ctx, "getMe", nil, &me); err != nil {
-		log.Printf("No se pudo iniciar el bot de Telegram; revise el token y la conexión")
-		return
+		return err
 	}
 	var webhook struct {
 		URL string `json:"url"`
 	}
 	if err := api.call(ctx, "getWebhookInfo", nil, &webhook); err != nil {
-		log.Printf("No se pudo comprobar la configuración del bot de Telegram")
-		return
+		return err
 	}
 	if webhook.URL != "" {
-		log.Printf("El bot @%s ya tiene un webhook configurado; no se inició la lectura por polling", me.Username)
-		return
+		return errTelegramWebhook
 	}
 	offset, err := a.telegramUpdateOffset()
 	if err != nil {
-		log.Printf("No se pudo leer el cursor de Telegram")
-		return
+		return errTelegramCursor
 	}
 	log.Printf("Bot de Telegram @%s activo; mostrará novedades pendientes por chat asignado o administrador", me.Username)
 	go a.runTelegramHourlyReminders(ctx, api, admins)
@@ -130,7 +154,7 @@ func (a *App) runTelegramBot(ctx context.Context, token string, admins map[int64
 		if err != nil {
 			log.Printf("No se pudieron consultar novedades de Telegram; se reintentará")
 			if !waitContext(ctx, 3*time.Second) {
-				return
+				return nil
 			}
 			continue
 		}
@@ -146,6 +170,7 @@ func (a *App) runTelegramBot(ctx context.Context, token string, admins map[int64
 			}
 		}
 	}
+	return nil
 }
 
 type telegramReminderProcess struct {
