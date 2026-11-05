@@ -58,6 +58,7 @@ type Process struct {
 	Items                                                                                        []ProcessItem
 	Documents                                                                                    []DocumentVersion
 	DocumentGroups                                                                               []DocumentGroup
+	TypeOptions                                                                                  []string
 	OpenObservationCount                                                                         int
 	OverdueObservationCount                                                                      int
 	ClosedObservationCount                                                                       int
@@ -76,7 +77,7 @@ type ProcessItem struct {
 type DocumentVersion struct {
 	ID, ProcessID, Version               int
 	Category, Label, Filename, CreatedAt string
-	Title, Kind                          string
+	Title, Kind, DocType                 string
 	Latest                               bool
 	SignatureStatus, SignatureAwardDate  string
 	Signatures                           []DocumentSignature
@@ -433,6 +434,12 @@ CREATE TABLE IF NOT EXISTS activity (
 		return err
 	}
 	if err := ensureColumn(db, "documents", "label", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "documents", "doc_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := adoptLegacyDocumentTypes(db); err != nil {
 		return err
 	}
 	if err := ensureColumn(db, "documents", "signature_report", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -1630,13 +1637,13 @@ func (a *App) processDetail(w http.ResponseWriter, r *http.Request) {
 			o.History = a.names("SELECT message || ' · ' || created_at FROM activity WHERE observation_id=? ORDER BY id", o.ID)
 		}
 	}
-	docs, docErr := a.db.Query(`SELECT id,process_id,category,label,version,filename,created_at,signature_report FROM documents WHERE process_id=? ORDER BY category,version DESC`, id)
+	docs, docErr := a.db.Query(`SELECT id,process_id,category,label,doc_type,version,filename,created_at,signature_report FROM documents WHERE process_id=? ORDER BY category,version DESC`, id)
 	if docErr == nil {
 		defer docs.Close()
 		for docs.Next() {
 			var d DocumentVersion
 			var signatureReport string
-			if docs.Scan(&d.ID, &d.ProcessID, &d.Category, &d.Label, &d.Version, &d.Filename, &d.CreatedAt, &signatureReport) == nil {
+			if docs.Scan(&d.ID, &d.ProcessID, &d.Category, &d.Label, &d.DocType, &d.Version, &d.Filename, &d.CreatedAt, &signatureReport) == nil {
 				var review SignatureReview
 				if json.Unmarshal([]byte(signatureReport), &review) == nil {
 					d.SignatureStatus = review.Status
@@ -1648,6 +1655,7 @@ func (a *App) processDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	p.DocumentGroups = groupDocuments(p.Documents)
+	p.TypeOptions = a.documentTypeOptions()
 	key, model := a.aiConfig()
 	data := PageData{AIEnabled: key != "", AIModel: model, Message: r.URL.Query().Get("msg"), NoveltyFilter: noveltyFilter}
 	_ = a.view.ExecuteTemplate(w, "detail", struct {
@@ -1659,71 +1667,77 @@ func (a *App) processDetail(w http.ResponseWriter, r *http.Request) {
 func (a *App) uploadDocument(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 25<<20)
 	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		http.Error(w, "Archivo inválido o mayor de 25 MB", http.StatusBadRequest)
+		uploadFail(w, r, "Archivo inválido o mayor de 25 MB", http.StatusBadRequest)
 		return
 	}
 	if r.MultipartForm != nil {
 		defer r.MultipartForm.RemoveAll()
 	}
 	id, err := strconv.Atoi(r.FormValue("process_id"))
-	category, label, catErr := documentCategoryFromForm(r.FormValue("category"), r.FormValue("document_label"))
+	spec, catErr := a.documentSpecFromForm(r.FormValue("category"), r.FormValue("document_label"), r.FormValue("new_type"))
 	if catErr != nil {
-		http.Error(w, catErr.Error(), 400)
+		uploadFail(w, r, catErr.Error(), 400)
 		return
 	}
+	category, label, docType := spec.Category, spec.Label, spec.DocType
 	if err != nil || id < 1 {
-		http.Error(w, "Proceso o tipo de documento inválido", 400)
+		uploadFail(w, r, "Proceso o tipo de documento inválido", 400)
 		return
 	}
 	var exists int
 	if err = a.db.QueryRow("SELECT count(*) FROM processes WHERE id=?", id).Scan(&exists); err != nil || exists == 0 {
-		http.NotFound(w, r)
+		uploadFail(w, r, "El proceso no existe", http.StatusNotFound)
 		return
 	}
 	f, header, err := r.FormFile("document")
 	if err != nil {
-		http.Error(w, "Selecciona un archivo", 400)
+		uploadFail(w, r, "Selecciona un archivo", 400)
 		return
 	}
 	defer f.Close()
 	filename := filepath.Base(strings.ReplaceAll(header.Filename, "\\", "/"))
 	if filename == "." || filename == "" {
-		http.Error(w, "Nombre de archivo inválido", 400)
+		uploadFail(w, r, "Nombre de archivo inválido", 400)
 		return
 	}
 	var version int
 	if err = a.db.QueryRow("SELECT COALESCE(MAX(version),0)+1 FROM documents WHERE process_id=? AND category=?", id, category).Scan(&version); err != nil {
-		http.Error(w, "No se pudo consultar el historial", 500)
+		uploadFail(w, r, "No se pudo consultar el historial", 500)
 		return
 	}
 	dir := filepath.Join(a.documentDir, strconv.Itoa(id), category)
 	if err = os.MkdirAll(dir, 0700); err != nil {
-		http.Error(w, "No se pudo preparar el almacenamiento", 500)
+		uploadFail(w, r, "No se pudo preparar el almacenamiento", 500)
 		return
 	}
 	var nonce [12]byte
 	if _, err = rand.Read(nonce[:]); err != nil {
-		http.Error(w, "No se pudo generar el nombre del archivo", 500)
+		uploadFail(w, r, "No se pudo generar el nombre del archivo", 500)
 		return
 	}
 	stored := fmt.Sprintf("v%d_%x%s", version, nonce[:], strings.ToLower(filepath.Ext(filename)))
 	path := filepath.Join(dir, stored)
 	out, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
-		http.Error(w, "No se pudo guardar el archivo", 500)
+		uploadFail(w, r, "No se pudo guardar el archivo", 500)
 		return
 	}
 	_, copyErr := io.Copy(out, io.LimitReader(f, 20<<20+1))
 	closeErr := out.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(path)
-		http.Error(w, "No se pudo guardar el archivo", 500)
+		uploadFail(w, r, "No se pudo guardar el archivo", 500)
 		return
 	}
 	info, err := os.Stat(path)
 	if err != nil || info.Size() > 20<<20 {
 		_ = os.Remove(path)
-		http.Error(w, "El archivo supera 20 MB", 400)
+		uploadFail(w, r, "El archivo supera 20 MB", 400)
+		return
+	}
+	if info.Size() == 0 {
+		_ = os.Remove(path)
+		uploadFail(w, r, "El archivo está vacío", 400)
 		return
 	}
 	review := SignatureReview{}
@@ -1731,28 +1745,27 @@ func (a *App) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		review = inspectDocumentSignatures(r.Context(), filename, path)
 	}
 	reviewJSON, _ := json.Marshal(review)
-	res, err := a.db.Exec("INSERT INTO documents(process_id,category,label,version,filename,stored_name,created_at,signature_report) VALUES(?,?,?,?,?,?,?,?)", id, category, label, version, filename, stored, now(), string(reviewJSON))
+	res, err := a.db.Exec("INSERT INTO documents(process_id,category,label,doc_type,version,filename,stored_name,created_at,signature_report) VALUES(?,?,?,?,?,?,?,?,?)", id, category, label, docType, version, filename, stored, now(), string(reviewJSON))
 	if err != nil {
 		_ = os.Remove(path)
-		http.Error(w, "No se pudo registrar la versión", 500)
+		uploadFail(w, r, "No se pudo registrar la versión", 500)
 		return
 	}
-	_ = res
+	documentID, _ := res.LastInsertId()
+	warning := ""
 	if category == "orden" || category == "contrato" {
 		if err = a.refreshProcessAwardDate(id); err != nil {
-			http.Error(w, "El documento se guardó, pero no se pudo actualizar la fecha de adjudicación", 500)
-			return
+			if !wantsJSON(r) {
+				http.Error(w, "El documento se guardó, pero no se pudo actualizar la fecha de adjudicación", 500)
+				return
+			}
+			// El archivo ya quedó registrado: se informa sin marcar la subida como fallida.
+			warning = "El documento se guardó, pero no se pudo actualizar la fecha de adjudicación"
 		}
 	}
-	label = "Términos de referencia"
-	if category == "orden" {
-		label = "Orden de compra"
-	}
-	if category == "contrato" {
-		label = "Contrato"
-	}
-	if strings.HasPrefix(category, "anexo-") {
-		label = r.FormValue("document_label")
+	label = documentTypeName(category, docType)
+	if !isStandardCategory(category) {
+		label += " · " + spec.Label
 	}
 	message := label + " guardado como versión " + strconv.Itoa(version)
 	if category == "orden" || category == "contrato" {
@@ -1764,6 +1777,11 @@ func (a *App) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(strings.ToLower(review.Status), "confianza") {
 			message += ". Revise la confianza de los certificados"
 		}
+	}
+	if wantsJSON(r) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": documentID, "version": version, "message": message, "warning": warning})
+		return
 	}
 	if !redirectToReturn(w, r, r.FormValue("return_to"), message) {
 		http.Redirect(w, r, "/process?id="+strconv.Itoa(id)+"&msg="+url.QueryEscape(message)+"#documentos", http.StatusSeeOther)

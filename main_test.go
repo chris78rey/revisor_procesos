@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -158,13 +161,16 @@ func TestGroupDocuments(t *testing.T) {
 		{ID: 4, Category: "orden", Version: 1, Filename: "o1.pdf"},
 		{ID: 5, Category: "anexo-aaa", Label: "Acta", Version: 1, Filename: "acta.docx"},
 		{ID: 6, Category: "orden", Version: 3, Filename: "o3.pdf"},
+		{ID: 7, Category: "anexo-ccc", Label: "Factura 2", DocType: "Facturas", Version: 1, Filename: "f2.pdf"},
+		{ID: 8, Category: "anexo-ddd", Label: "Factura 1", DocType: "Facturas", Version: 1, Filename: "f1.pdf"},
+		{ID: 9, Category: "anexo-ddd", Label: "Factura 1", DocType: "Facturas", Version: 2, Filename: "f1b.pdf"},
 	}
 	groups := groupDocuments(docs)
 	var titles []string
 	for _, g := range groups {
 		titles = append(titles, g.Title)
 	}
-	if want := []string{"Orden de compra", "Contrato", "Acta", "Pliego"}; !reflect.DeepEqual(titles, want) {
+	if want := []string{"Orden de compra", "Contrato", "Factura 1", "Factura 2", "Acta", "Pliego"}; !reflect.DeepEqual(titles, want) {
 		t.Fatalf("orden de grupos %v, esperado %v", titles, want)
 	}
 	orden := groups[0]
@@ -174,24 +180,101 @@ func TestGroupDocuments(t *testing.T) {
 	if !orden.Versions[0].Latest || orden.Versions[1].Latest || orden.Latest.ID != 6 {
 		t.Fatalf("solo la versión mayor debe ser vigente: %+v", orden.Versions)
 	}
-	if orden.Versions[1].Kind != "image" || orden.Versions[0].Kind != "pdf" || groups[2].Versions[0].Kind != "" {
+	if orden.Versions[1].Kind != "image" || orden.Versions[0].Kind != "pdf" || groups[4].Versions[0].Kind != "" {
 		t.Fatal("el tipo de visor no se calculó bien")
+	}
+	if groups[2].Type != "Facturas" || groups[2].Rank != 3 || groups[2].Key != "t:facturas|factura 1" || len(groups[2].Versions) != 2 {
+		t.Fatalf("las facturas deben agruparse por documento dentro del tipo: %+v", groups[2])
+	}
+	if groups[4].Type != "Anexos" || groups[4].Rank != 4 || groups[4].Key != "anexo:acta" || groups[0].Type != "Orden de compra" || groups[0].Key != "orden" {
+		t.Fatalf("tipos de los demás grupos: %+v %+v", groups[0], groups[4])
 	}
 }
 
-func TestDocumentCategoryFromForm(t *testing.T) {
-	if c, l, err := documentCategoryFromForm("contrato", "ignorado"); err != nil || c != "contrato" || l != "" {
-		t.Fatalf("contrato: %q %q %v", c, l, err)
+func TestDocumentSpecFromForm(t *testing.T) {
+	a := newTestApp(t)
+	// Tipos estándar: el nombre se ignora.
+	if sp, err := a.documentSpecFromForm("contrato", "ignorado", ""); err != nil || sp.Category != "contrato" || sp.Label != "" || sp.DocType != "" {
+		t.Fatalf("contrato: %+v %v", sp, err)
 	}
-	c1, l1, err := documentCategoryFromForm("anexo", " Pliego ")
-	c2, _, _ := documentCategoryFromForm("anexo", "pliego")
-	if err != nil || !strings.HasPrefix(c1, "anexo-") || l1 != "Pliego" || c1 != c2 {
-		t.Fatalf("el anexo debe identificarse por nombre sin distinguir mayúsculas: %q %q %v", c1, l1, err)
+	// Un tipo predefinido o creado: tipo + nombre identifican al documento.
+	f1, err := a.documentSpecFromForm("t:Facturas", " Factura 001 ", "")
+	f2, _ := a.documentSpecFromForm("t:facturas", "factura 001", "")
+	f3, _ := a.documentSpecFromForm("t:Facturas", "Factura 002", "")
+	notif, _ := a.documentSpecFromForm("t:Notificaciones", "Factura 001", "")
+	if err != nil || f1.DocType != "Facturas" || f1.Label != "Factura 001" || !strings.HasPrefix(f1.Category, "anexo-") || len(f1.Category) != 18 {
+		t.Fatalf("factura: %+v %v", f1, err)
 	}
-	for _, bad := range [][2]string{{"anexo", ""}, {"anexo", strings.Repeat("a", 161)}, {"../x", ""}, {"anexo-abc", ""}, {"", ""}} {
-		if _, _, err := documentCategoryFromForm(bad[0], bad[1]); err == nil {
+	if f1.Category != f2.Category || f2.DocType != "Facturas" {
+		t.Fatal("mismo tipo y nombre (sin importar mayúsculas) deben ser el mismo documento, con la escritura canónica del tipo")
+	}
+	if f1.Category == f3.Category || f1.Category == notif.Category {
+		t.Fatal("otro nombre u otro tipo deben ser otro documento")
+	}
+	// Tipo nuevo: se crea y luego se reutiliza sin duplicarse por mayúsculas o tildes.
+	g, err := a.documentSpecFromForm("__new", "Póliza 1", "Garantías")
+	if err != nil || g.DocType != "Garantías" {
+		t.Fatalf("tipo nuevo: %+v %v", g, err)
+	}
+	if _, err = a.db.Exec(`INSERT INTO processes(id,code,object,created_at) VALUES(1,'X','x','2026-11-01 09:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	a.testTypedDocument(t, g, 1, "poliza.pdf")
+	if again, _ := a.documentSpecFromForm("__new", "Póliza 2", "garantias"); again.DocType != "Garantías" {
+		t.Fatalf("debe reutilizar «Garantías», se obtuvo %q", again.DocType)
+	}
+	if !reflect.DeepEqual(a.documentTypeOptions(), []string{"Facturas", "Notificaciones", "Informes", "Actas", "Garantías"}) {
+		t.Fatalf("opciones de tipo: %v", a.documentTypeOptions())
+	}
+	// Escribir un nombre de tipo estándar no crea un tipo paralelo.
+	for name, want := range map[string]string{"Contrato": "contrato", "orden de compra": "orden", "Términos de referencia": "terminos"} {
+		if sp, err := a.documentSpecFromForm("__new", "", name); err != nil || sp.Category != want {
+			t.Errorf("%q: %+v %v", name, sp, err)
+		}
+	}
+	// «Anexos» es el grupo sin tipo (compatible con los anexos antiguos).
+	legacy, _ := a.documentSpecFromForm("anexo", "Pliego", "")
+	viaName, _ := a.documentSpecFromForm("__new", "Pliego", "Anexos")
+	if legacy.DocType != "" || legacy.Category != viaName.Category {
+		t.Fatalf("anexo sin tipo: %+v vs %+v", legacy, viaName)
+	}
+	for _, bad := range [][3]string{{"anexo", "", ""}, {"t:Facturas", "", ""}, {"t:Facturas", strings.Repeat("a", 161), ""}, {"__new", "x", ""}, {"__new", "x", strings.Repeat("t", 61)}, {"../x", "", ""}, {"anexo-abc", "", ""}, {"", "", ""}} {
+		if _, err := a.documentSpecFromForm(bad[0], bad[1], bad[2]); err == nil {
 			t.Errorf("se esperaba error para %q", bad)
 		}
+	}
+}
+
+func (a *App) testTypedDocument(t *testing.T, spec documentSpec, version int, filename string) int {
+	t.Helper()
+	res, err := a.db.Exec(`INSERT INTO documents(process_id,category,label,doc_type,version,filename,stored_name,created_at,signature_report) VALUES(1,?,?,?,?,?,?,'2026-11-01 10:00:00','{}')`,
+		spec.Category, spec.Label, spec.DocType, version, filename, "v1_x.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	return int(id)
+}
+
+func TestAdoptLegacyDocumentTypes(t *testing.T) {
+	a := newTestApp(t)
+	if _, err := a.db.Exec(`INSERT INTO processes(id,code,object,created_at) VALUES(1,'X','x','2026-11-01 09:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	fac := a.testTypedDocument(t, documentSpec{Category: "anexo-aaaaaaaaaaaa", Label: "FACTURAS"}, 1, "f.pdf")
+	not := a.testTypedDocument(t, documentSpec{Category: "anexo-bbbbbbbbbbbb", Label: "Notificación"}, 1, "n.pdf")
+	otro := a.testTypedDocument(t, documentSpec{Category: "anexo-cccccccccccc", Label: "2NOTIFICACIONJAIME-signed"}, 1, "o.pdf")
+	std := a.testTypedDocument(t, documentSpec{Category: "contrato"}, 1, "c.pdf")
+	if err := adoptLegacyDocumentTypes(a.db); err != nil {
+		t.Fatal(err)
+	}
+	typeOf := func(id int) string {
+		var d string
+		a.db.QueryRow(`SELECT doc_type FROM documents WHERE id=?`, id).Scan(&d)
+		return d
+	}
+	if typeOf(fac) != "Facturas" || typeOf(not) != "" || typeOf(otro) != "" || typeOf(std) != "" {
+		t.Fatalf("migración: %q %q %q %q", typeOf(fac), typeOf(not), typeOf(otro), typeOf(std))
 	}
 }
 
@@ -340,12 +423,29 @@ func TestDocumentViewerAndClassification(t *testing.T) {
 	if _, err := os.Stat(a.documentPath(1, "orden", "v1_test.pdf")); !os.IsNotExist(err) {
 		t.Fatal("el archivo original debería haberse movido")
 	}
-	// Reclasificar como anexo exige nombre, y repetir el mismo tipo no cambia nada.
-	if w := do("POST", fmt.Sprintf("/documents/%d/classify", v1), url.Values{"category": {"anexo"}}); w.Code != 400 {
+	// Sin nombre se usa el del archivo; con tipo creado en el momento queda en ese tipo.
+	if w := do("POST", fmt.Sprintf("/documents/%d/classify", v1), url.Values{"category": {"anexo"}}); w.Code != http.StatusSeeOther {
 		t.Fatalf("anexo sin nombre: %d", w.Code)
 	}
-	if w := do("POST", fmt.Sprintf("/documents/%d/classify", v1), url.Values{"category": {"anexo"}, "document_label": {"Informe"}}); w.Code != http.StatusSeeOther {
-		t.Fatalf("anexo con nombre: %d", w.Code)
+	var docType string
+	if err := a.db.QueryRow(`SELECT category,label,doc_type FROM documents WHERE id=?`, v1).Scan(&category, &stored, &docType); err != nil || !strings.HasPrefix(category, "anexo-") || stored != "orden-v1" || docType != "" {
+		t.Fatalf("nombre por defecto: %q %q %q %v", category, stored, docType, err)
+	}
+	if w := do("POST", fmt.Sprintf("/documents/%d/classify", v1), url.Values{"category": {"__new"}, "new_type": {"Garantías"}, "document_label": {"Póliza 1"}}); w.Code != http.StatusSeeOther {
+		t.Fatalf("tipo nuevo: %d %s", w.Code, w.Body.String())
+	}
+	if err := a.db.QueryRow(`SELECT label,doc_type FROM documents WHERE id=?`, v1).Scan(&stored, &docType); err != nil || stored != "Póliza 1" || docType != "Garantías" {
+		t.Fatalf("tipo nuevo guardado: %q %q %v", stored, docType, err)
+	}
+	if w := do("POST", fmt.Sprintf("/documents/%d/classify", v1), url.Values{"category": {"t:Garantías"}, "document_label": {"póliza 1"}}); w.Code != http.StatusSeeOther || !strings.Contains(w.Header().Get("Location"), url.QueryEscape("ya tiene ese tipo")) {
+		t.Fatalf("mismo tipo y nombre no debe cambiar nada: %d %q", w.Code, w.Header().Get("Location"))
+	}
+	if w := do("POST", fmt.Sprintf("/documents/%d/classify", v1), url.Values{"category": {"__new"}, "new_type": {" "}}); w.Code != 400 {
+		t.Fatalf("tipo nuevo vacío: %d", w.Code)
+	}
+	// La página muestra el tipo creado como botón y en el selector.
+	if page := do("GET", "/process?id=1", nil); !strings.Contains(page.Body.String(), `data-type="Garantías"`) || !strings.Contains(page.Body.String(), `value="t:Garantías"`) {
+		t.Fatal("la página debe mostrar el tipo Garantías")
 	}
 	if w := do("POST", "/documents/999/classify", url.Values{"category": {"orden"}}); w.Code != 404 {
 		t.Fatalf("documento inexistente: %d", w.Code)
@@ -364,5 +464,81 @@ func TestDocumentViewerAndClassification(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("el archivo borrado sigue en disco")
+	}
+}
+
+func TestUploadDocumentJSON(t *testing.T) {
+	a := newTestApp(t)
+	if _, err := a.db.Exec(`INSERT INTO processes(id,code,object,created_at) VALUES(1,'RE-1','Compra','2026-11-01 09:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	post := func(fields map[string]string, filename string, content []byte, json bool) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		for k, v := range fields {
+			mw.WriteField(k, v)
+		}
+		if filename != "" {
+			fw, _ := mw.CreateFormFile("document", filename)
+			fw.Write(content)
+		}
+		mw.Close()
+		r := httptest.NewRequest("POST", "/processes/documents", &body)
+		r.Header.Set("Content-Type", mw.FormDataContentType())
+		if json {
+			r.Header.Set("Accept", "application/json")
+		}
+		w := httptest.NewRecorder()
+		a.uploadDocument(w, r)
+		return w
+	}
+	decode := func(w *httptest.ResponseRecorder) map[string]any {
+		var out map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("respuesta no es JSON (%d): %q", w.Code, w.Body.String())
+		}
+		return out
+	}
+
+	// Subida correcta: JSON con la versión asignada.
+	w := post(map[string]string{"process_id": "1", "category": "terminos"}, "tdr.pdf", []byte("%PDF-1.7 x"), true)
+	out := decode(w)
+	if w.Code != 200 || out["ok"] != true || out["version"] != float64(1) {
+		t.Fatalf("subida: %d %v", w.Code, out)
+	}
+	w = post(map[string]string{"process_id": "1", "category": "terminos"}, "tdr2.pdf", []byte("%PDF-1.7 y"), true)
+	if out = decode(w); out["version"] != float64(2) {
+		t.Fatalf("la segunda subida debe ser la versión 2: %v", out)
+	}
+	// Anexos: el nombre es obligatorio y cada nombre tiene su propio historial.
+	w = post(map[string]string{"process_id": "1", "category": "anexo"}, "a.pdf", []byte("%PDF-1.7"), true)
+	if out = decode(w); w.Code != 400 || out["ok"] != false || !strings.Contains(fmt.Sprint(out["error"]), "nombre del documento") {
+		t.Fatalf("anexo sin nombre: %d %v", w.Code, out)
+	}
+	w = post(map[string]string{"process_id": "1", "category": "anexo", "document_label": "Acta"}, "a.pdf", []byte("%PDF-1.7"), true)
+	if out = decode(w); out["version"] != float64(1) || !strings.Contains(fmt.Sprint(out["message"]), "Acta") {
+		t.Fatalf("anexo: %v", out)
+	}
+	// Archivo vacío, sin archivo y proceso inexistente: error JSON, sin dejar registros.
+	if w = post(map[string]string{"process_id": "1", "category": "contrato"}, "vacio.pdf", nil, true); w.Code != 400 || !strings.Contains(fmt.Sprint(decode(w)["error"]), "vacío") {
+		t.Fatalf("archivo vacío: %d %s", w.Code, w.Body.String())
+	}
+	if w = post(map[string]string{"process_id": "1", "category": "contrato"}, "", nil, true); w.Code != 400 {
+		t.Fatalf("sin archivo: %d", w.Code)
+	}
+	if w = post(map[string]string{"process_id": "99", "category": "contrato"}, "x.pdf", []byte("x"), true); w.Code != 404 {
+		t.Fatalf("proceso inexistente: %d", w.Code)
+	}
+	var count int
+	a.db.QueryRow(`SELECT count(*) FROM documents`).Scan(&count)
+	if count != 3 {
+		t.Fatalf("debían quedar 3 documentos, hay %d", count)
+	}
+	// Sin Accept: JSON se mantiene el comportamiento anterior (redirección y errores en texto).
+	if w = post(map[string]string{"process_id": "1", "category": "terminos"}, "tdr3.pdf", []byte("%PDF-1.7 z"), false); w.Code != http.StatusSeeOther {
+		t.Fatalf("sin JSON debe redirigir: %d", w.Code)
+	}
+	if w = post(map[string]string{"process_id": "1", "category": "contrato"}, "", nil, false); w.Code != 400 || strings.Contains(w.Header().Get("Content-Type"), "json") {
+		t.Fatalf("error sin JSON: %d %q", w.Code, w.Header().Get("Content-Type"))
 	}
 }

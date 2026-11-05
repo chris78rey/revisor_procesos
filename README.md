@@ -57,8 +57,10 @@ sqlite3 data/revisor.db ".backup 'revisor-backup.db'"
 
 En la pestaña **Documentos** de cada proceso, los archivos se agrupan por tipo (orden de compra, contrato, términos de referencia y cada anexo por su nombre). Cada carga crea una versión nueva; la más reciente aparece como **Vigente** y las demás como **Anterior**.
 
+- **Tipos de documento:** además de orden de compra, contrato y términos de referencia hay tipos como **Facturas**, **Notificaciones**, **Informes** y **Actas**, y puedes crear los tuyos con «＋ Nuevo tipo…» (se reutilizan en todos los procesos). Dentro de un tipo cada documento tiene su nombre: dos facturas distintas son dos documentos; subir otra vez el mismo nombre en el mismo tipo agrega una versión nueva de ese documento. Al subir un archivo se sugiere el tipo según su nombre (por ejemplo «factura» → Facturas) y el nombre del documento parte del nombre del archivo.
+- **Ver por tipo:** botones sobre la lista (Todos y uno por cada tipo que tenga documentos) con el número de documentos; se recuerda el último elegido.
 - **Ordenar y filtrar:** ordena los tipos (estándar, actividad reciente o nombre), invierte el orden de las versiones, muestra solo la vigente o busca por nombre de archivo.
-- **Cambiar tipo:** reclasifica un documento ya cargado. Pasa a ser la versión más reciente del tipo elegido y su archivo se mueve a la carpeta correspondiente. Si el nuevo tipo es orden o contrato se verifican sus firmas.
+- **Cambiar tipo:** reclasifica un documento ya cargado (tipo y, si quieres, nombre). Pasa a ser la versión más reciente del documento de destino y su archivo se mueve a la carpeta correspondiente. Si el nuevo tipo es orden o contrato se verifican sus firmas.
 - **Visor integrado:** el botón **Ver** abre PDFs e imágenes (PNG, JPG, GIF, WebP) dentro de la aplicación, con navegación entre documentos (botones o flechas del teclado). El contenido se comprueba antes de mostrarlo; SVG y HTML nunca se sirven en línea.
 
 ## Seguridad
